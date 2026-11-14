@@ -7,7 +7,18 @@ from fastapi.staticfiles import StaticFiles
 from itsdangerous import BadSignature, URLSafeSerializer
 
 from app.config import Config
-from app.db import get_db, get_pipeline, init_db, list_pipelines, run_extract, run_load
+from app import db as store
+from app.db import (
+    ERR_BAD_REQUEST,
+    ERR_CONFLICT,
+    ERR_NOT_FOUND,
+    get_db,
+    get_pipeline,
+    init_db,
+    list_pipelines,
+    run_extract,
+    run_load,
+)
 
 ROOT = Path(__file__).resolve().parent.parent
 STATIC = ROOT / "static"
@@ -33,6 +44,13 @@ def require_user(request: Request) -> str:
     if user != Config.ADMIN_USER:
         raise HTTPException(status_code=401, detail="未登录")
     return user
+
+
+def _result(payload: dict) -> JSONResponse:
+    status = payload.get("status")
+    if payload.get("ok") is False and isinstance(status, int):
+        return JSONResponse(payload, status_code=status)
+    return JSONResponse(payload)
 
 
 @app.on_event("startup")
@@ -94,6 +112,13 @@ def api_pipelines(user: str = Depends(require_user)):
         return {"items": list_pipelines(conn)}
 
 
+@app.get("/api/overview")
+def api_overview(user: str = Depends(require_user)):
+    with get_db() as conn:
+        items = store.list_overview(conn)
+    return {"items": items}
+
+
 @app.get("/api/pipelines/{pipeline_id}")
 def api_pipeline_detail(pipeline_id: int, user: str = Depends(require_user)):
     with get_db() as conn:
@@ -101,6 +126,97 @@ def api_pipeline_detail(pipeline_id: int, user: str = Depends(require_user)):
     if not item:
         raise HTTPException(status_code=404, detail="管道不存在")
     return item
+
+
+@app.get("/api/pipelines/{pipeline_id}/overview")
+def api_pipeline_overview(pipeline_id: int, user: str = Depends(require_user)):
+    with get_db() as conn:
+        item = get_pipeline(conn, pipeline_id)
+        if not item:
+            raise HTTPException(status_code=404, detail="管道不存在")
+        payload = store.pipeline_overview(conn, item)
+    payload["中文"] = {
+        "主源条数": payload["primary_count"],
+        "次源条数": payload["secondary_count"],
+        "冲突数": payload["conflict_count"],
+        "策略名": payload["strategy_name"],
+    }
+    return payload
+
+
+@app.get("/api/pipelines/{pipeline_id}/sources")
+def api_sources(pipeline_id: int, user: str = Depends(require_user)):
+    with get_db() as conn:
+        item = get_pipeline(conn, pipeline_id)
+        if not item:
+            raise HTTPException(status_code=404, detail="管道不存在")
+        return {"items": store.get_sources(conn, pipeline_id)}
+
+
+@app.post("/api/pipelines/{pipeline_id}/sources/{role}/extract")
+def api_source_extract(pipeline_id: int, role: str, user: str = Depends(require_user)):
+    with get_db() as conn:
+        payload = store.run_source_extract(conn, pipeline_id, role)
+    return _result(payload)
+
+
+@app.get("/api/pipelines/{pipeline_id}/merge")
+def api_merge_snapshot(pipeline_id: int, user: str = Depends(require_user)):
+    with get_db() as conn:
+        payload = store.merge_snapshot(conn, pipeline_id)
+    if payload.get("ok") is False:
+        raise HTTPException(status_code=404, detail=payload.get("error", "管道不存在"))
+    return payload
+
+
+@app.get("/api/pipelines/{pipeline_id}/merge/preview")
+def api_merge_preview(pipeline_id: int, user: str = Depends(require_user)):
+    with get_db() as conn:
+        payload = store.merge_snapshot(conn, pipeline_id)
+    if payload.get("ok") is False:
+        raise HTTPException(status_code=404, detail=payload.get("error", "管道不存在"))
+    return {
+        "pipeline": payload["pipeline"],
+        "overview": payload["overview"],
+        "strategy": payload["strategy"],
+        "merge_key": payload["merge_key"],
+        "sources": payload["sources"],
+        "preview": payload["preview"],
+        "claims": payload["claims"],
+    }
+
+
+@app.post("/api/pipelines/{pipeline_id}/merge-config")
+async def api_merge_config(pipeline_id: int, request: Request, user: str = Depends(require_user)):
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    if not isinstance(body, dict):
+        body = {}
+    with get_db() as conn:
+        payload = store.update_merge_config(conn, pipeline_id, body)
+    return _result(payload)
+
+
+@app.put("/api/pipelines/{pipeline_id}/merge-config")
+async def api_merge_config_put(pipeline_id: int, request: Request, user: str = Depends(require_user)):
+    return await api_merge_config(pipeline_id, request, user)
+
+
+@app.post("/api/pipelines/{pipeline_id}/merge")
+async def api_merge(pipeline_id: int, request: Request, user: str = Depends(require_user)):
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    if not isinstance(body, dict):
+        body = {}
+    policy = body.get("conflict_policy", body.get("policy"))
+    key = body.get("merge_key")
+    with get_db() as conn:
+        payload = store.run_merge(conn, pipeline_id, user, policy, key)
+    return _result(payload)
 
 
 @app.post("/api/pipelines/{pipeline_id}/extract")
@@ -118,6 +234,8 @@ def api_load(pipeline_id: int, user: str = Depends(require_user)):
         item = run_load(conn, pipeline_id)
     if not item:
         raise HTTPException(status_code=404, detail="管道不存在")
+    if item.get("_load_blocked"):
+        return JSONResponse(item, status_code=item["status"])
     return item
 
 

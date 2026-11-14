@@ -14,40 +14,188 @@
       <span class="who">{{ me }}</span>
       <button class="ghost" @click="logout">退出</button>
     </header>
-    <p class="muted">基线能力：管道列表、抽取、落库。后续题面在此叠加增量水位、清洗规则、并发争用等。</p>
+    <p class="muted">
+      双源合并：键冲突策略锁定当天不得更换。合并键与裁决均由服务端执行，预览可核对冲突与抢占记录。
+    </p>
+    <div v-if="msg" class="flash">{{ msg }}</div>
+
     <div class="board">
-      <section class="panel">
-        <h2>管道列表</h2>
+      <section class="panel list-panel">
+        <h2>管道总览</h2>
         <div v-if="!items.length" class="empty">暂无管道</div>
         <div
           v-for="p in items"
           :key="p.id"
-          class="row"
+          class="row card-row"
           :class="{ active: current && current.id === p.id }"
           @click="open(p.id)"
         >
-          <div>
-            <div>{{ p.title }}</div>
-            <div class="code">{{ p.code }} · {{ p.source_uri }}</div>
+          <div class="row-main">
+            <div class="row-title">
+              <span>{{ p.title }}</span>
+              <span class="tag" :class="statusClass(p.merge_status)">{{ p.merge_status }}</span>
+            </div>
+            <div class="code">{{ p.code }} · {{ p.merge_key || '合并键未设置' }}</div>
+            <div class="mini-grid">
+              <span>主源 <b>{{ p.primary_count }}</b></span>
+              <span>次源 <b>{{ p.secondary_count }}</b></span>
+              <span>冲突 <b class="conflict-num">{{ p.conflict_count }}</b></span>
+              <span>策略 <b>{{ p.strategy_name }}</b></span>
+            </div>
+            <div v-if="p.blockers && p.blockers.length" class="blocker-line">
+              不可合并：{{ p.blockers.join('；') }}
+            </div>
           </div>
-          <span class="tag" :class="tagClass(p.status)">{{ p.status }}</span>
         </div>
       </section>
-      <section class="panel">
-        <h2>管道详情</h2>
-        <div v-if="!current" class="empty">点左侧一条查看抽取与落库状态</div>
+
+      <section class="panel detail-panel">
+        <div v-if="!current" class="empty">点左侧一条管道，查看总览、源对照册、合并预览与冲突设置</div>
         <template v-else>
-          <p class="kv"><b>题名</b>{{ current.title }}</p>
-          <p class="kv"><b>编码</b><span class="code">{{ current.code }}</span></p>
-          <p class="kv"><b>源地址</b><span class="code">{{ current.source_uri }}</span></p>
-          <p class="kv"><b>状态</b><span class="tag" :class="tagClass(current.status)">{{ current.status }}</span></p>
-          <p class="kv"><b>已抽取</b>{{ current.extracted }}</p>
-          <p class="kv"><b>已落库</b>{{ current.loaded }}</p>
-          <div class="actions">
-            <button @click="extract" :disabled="busy">执行抽取</button>
-            <button class="ghost" @click="load" :disabled="busy">执行落库</button>
+          <div class="detail-head">
+            <h2>{{ current.title }}</h2>
+            <span class="tag" :class="statusClass(current.merge_status)">{{ current.merge_status }}</span>
           </div>
-          <p v-if="msg" class="muted">{{ msg }}</p>
+          <nav class="tabs">
+            <button
+              v-for="tab in tabs"
+              :key="tab.key"
+              class="tab"
+              :class="{ on: activeTab === tab.key }"
+              @click="activeTab = tab.key"
+            >{{ tab.label }}</button>
+          </nav>
+
+          <!-- 管道总览 -->
+          <div v-if="activeTab === 'overview'" class="tab-body">
+            <p class="kv"><b>题名</b>{{ current.title }}</p>
+            <p class="kv"><b>编码</b><span class="code">{{ current.code }}</span></p>
+            <p class="kv"><b>合并键</b><span class="code">{{ current.merge_key || '（空，禁止开跑）' }}</span></p>
+            <p class="kv"><b>策略</b>{{ current.strategy_name }}</p>
+            <p class="kv"><b>锁定</b>
+              <span v-if="current.policy_locked_at">{{ current.policy_locked_at }} · {{ policyName(current.policy_locked_code) }}</span>
+              <span v-else class="muted">尚未锁定</span>
+            </p>
+            <div class="stat-grid">
+              <div class="stat"><span>主源条数</span><b>{{ current.primary_count }}</b></div>
+              <div class="stat"><span>次源条数</span><b>{{ current.secondary_count }}</b></div>
+              <div class="stat"><span>冲突数</span><b class="conflict-num">{{ current.conflict_count }}</b></div>
+              <div class="stat"><span>策略名</span><b class="small">{{ current.strategy_name }}</b></div>
+            </div>
+            <div class="actions">
+              <button @click="runMerge" :disabled="busy || !current.preview.can_merge">执行合并</button>
+              <button class="ghost" @click="extract" :disabled="busy">执行抽取</button>
+              <button class="ghost" @click="load" :disabled="busy">执行落库</button>
+            </div>
+            <p v-if="current.preview.blockers.length" class="warn-box">
+              {{ current.preview.blockers.join('；') }}
+            </p>
+            <p v-if="msg" class="muted">{{ msg }}</p>
+          </div>
+
+          <!-- 源对照册 -->
+          <div v-if="activeTab === 'sources'" class="tab-body">
+            <p class="muted">两源必须各自抽取成功才能合并。主源与次源按角色并排对照。</p>
+            <div class="source-grid">
+              <article v-for="s in current.sources" :key="s.role" class="source-card">
+                <header>
+                  <span class="role-chip" :class="s.role === '主源' ? 'primary' : 'secondary'">{{ s.role }}</span>
+                  <span class="tag" :class="s.status === '已抽取' ? 'ok' : ''">{{ s.status }}</span>
+                </header>
+                <p class="code">{{ s.source_uri }}</p>
+                <p class="kv"><b>条数</b>{{ s.extracted }}</p>
+                <p class="kv"><b>抽取于</b>{{ s.extracted_at || '—' }}</p>
+                <button class="ghost small-btn" @click="extractSource(s.role)" :disabled="busy">抽取{{ s.role }}</button>
+              </article>
+            </div>
+          </div>
+
+          <!-- 合并预览 -->
+          <div v-if="activeTab === 'preview'" class="tab-body">
+            <div class="stat-grid">
+              <div class="stat"><span>主源条数</span><b>{{ current.preview.primary_count }}</b></div>
+              <div class="stat"><span>次源条数</span><b>{{ current.preview.secondary_count }}</b></div>
+              <div class="stat"><span>冲突数</span><b class="conflict-num">{{ current.preview.conflict_count }}</b></div>
+              <div class="stat"><span>合并后</span><b>{{ current.preview.merged_count }}</b></div>
+            </div>
+            <p class="muted">
+              策略：{{ current.strategy_name }} · 合并键：<span class="code">{{ current.merge_key || '未设置' }}</span>
+            </p>
+
+            <h3>冲突行 <span class="count">{{ current.preview.conflicts.length }}</span></h3>
+            <div v-if="!current.preview.conflicts.length" class="empty">无同键不同值冲突</div>
+            <div
+              v-for="(c, idx) in current.preview.conflicts"
+              :key="c.key_value + idx"
+              class="conflict"
+            >
+              <button class="conflict-head" @click="toggleConflict(c.key_value)">
+                <span class="code">{{ c.key_value }}</span>
+                <span class="tag warn">{{ c.resolution }}</span>
+                <span class="chev">{{ openConflict === c.key_value ? '收起' : '展开' }}</span>
+              </button>
+              <div v-if="openConflict === c.key_value" class="conflict-body">
+                <p class="kv"><b>裁决说明</b>{{ c.note }}</p>
+                <div class="diff-grid">
+                  <div class="diff-head">
+                    <span>字段</span><span>主源</span><span>次源</span>
+                  </div>
+                  <div v-for="(d, field) in c.diffs" :key="field" class="diff-row">
+                    <span class="code">{{ field }}</span>
+                    <span>{{ d.primary }}</span>
+                    <span>{{ d.secondary }}</span>
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            <h3>合并抢占记录 <span class="count">{{ current.claims.length }}</span></h3>
+            <div v-if="!current.claims.length" class="empty">本轮暂无合并争抢</div>
+            <ul class="claim-list">
+              <li v-for="c in current.claims" :key="c.id">
+                <span class="tag" :class="c.outcome === '抢占成功' ? 'ok' : 'warn'">{{ c.outcome }}</span>
+                <span>{{ c.user }}</span>
+                <span class="muted">{{ c.reason }}</span>
+                <span class="code">{{ c.created_at }}</span>
+              </li>
+            </ul>
+          </div>
+
+          <!-- 冲突设置 -->
+          <div v-if="activeTab === 'config'" class="tab-body">
+            <p class="muted">策略锁定当天不得更换；换策略会被拒绝。</p>
+            <label class="field">
+              合并键字段
+              <input v-model="form.merge_key" placeholder="如 order_id" />
+            </label>
+            <div class="policy-options">
+              <label
+                v-for="opt in policyOptions"
+                :key="opt.code"
+                class="policy-option"
+                :class="{ on: form.conflict_policy === opt.code, locked: isLocked && current.policy_locked_code !== opt.code }"
+              >
+                <input
+                  type="radio"
+                  :value="opt.code"
+                  v-model="form.conflict_policy"
+                  :disabled="isLocked && current.policy_locked_code !== opt.code"
+                />
+                <span>
+                  <b>{{ opt.name }}</b>
+                  <em>{{ opt.desc }}</em>
+                </span>
+              </label>
+            </div>
+            <div class="actions">
+              <button @click="saveConfig" :disabled="busy">保存设置</button>
+              <button class="ghost" @click="resetForm" :disabled="busy">还原</button>
+            </div>
+            <p v-if="configMsg" class="muted">{{ configMsg }}</p>
+            <p v-if="current.policy_locked_at" class="warn-box">
+              策略已于 {{ current.policy_locked_at }} 锁定为「{{ policyName(current.policy_locked_code) }}」，当天不得更换。
+            </p>
+          </div>
         </template>
       </section>
     </div>
